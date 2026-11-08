@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from wb_fingerprint import derive_id, generate_request_id, session_id
+import wb_pool_scope
 import wb_activity
 import wb_atrest
 import wb_catalog
@@ -4828,23 +4829,29 @@ class AccountPool(object):
             return [a for a in self.accounts
                     if (not realm or a.realm == realm) and a.task_active()]
 
-    def count_ready(self, realm=None, model=None, allowed=None, refresh=True):
+    def count_ready(self, realm=None, model=None, allowed=None, refresh=True,
+                    scope=None):
         """How many accounts can serve right now.
 
         `refresh=False` keeps the count read-only: `Account.ready()` normally
         refreshes a credential that is about to expire, and a probe that asks
         "how many accounts are left" must not turn into a network call per
         model (issue #667).
+
+        `scope` 限定号池（见 wb_pool_scope）：文本号池与媒体号池各有各的可用
+        数，面板与并发上限都按各自的池子算，不能拿两个池子加起来的数字。
         """
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if scope is not None:
+            snapshot = [a for a in snapshot if wb_pool_scope.in_scope(a, scope)]
         return sum(1 for a in snapshot
                    if a.enabled and a.access_token
                    and a.ready(model=model, refresh=refresh)
                    and (allowed is None or a.uid in allowed))
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
-                         page=None, allowed=None):
+                         page=None, allowed=None, scope=None):
         """Pick the account for one turn of a conversation.
 
         Three shapes, in order of preference:
@@ -4862,20 +4869,7 @@ class AccountPool(object):
           every oversized body onto a single account.
         """
         exclude = exclude or set()
-        # A page that covers the whole realm is not a page at all: every
-        # oversized conversation would rotate through the entire pool and lose
-        # its prefix cache every turn (issue #718). Bind it like a normal
-        # conversation instead; real multi-page pools keep rotating.
-        whole_pool_page = False
-        if page is not None:
-            with self._lock:
-                pool_size = sum(1 for a in self.accounts
-                                if not realm or a.realm == realm)
-            try:
-                whole_pool_page = int(page[1]) >= pool_size
-            except (TypeError, ValueError, IndexError):
-                whole_pool_page = False
-        if session_key and (page is None or whole_pool_page):
+        if session_key and page is None:
             for uid in self.affinity.recent(session_key):
                 if uid in exclude:
                     continue
@@ -4885,28 +4879,34 @@ class AccountPool(object):
                 if allowed is not None and uid not in allowed:
                     continue
                 account = self.get(uid)
+                # 会话绑定也不能绕过号池边界：这个号上一轮跑的是对话，不代表
+                # 它此刻还在文本号池里（面板可能刚把它划到媒体号池）。
+                if scope is not None and not wb_pool_scope.in_scope(account, scope):
+                    account = None
                 if account and account.realm == realm and account.ready(model=model):
                     self.affinity.bind(session_key, uid)
                     return account
-        account = self.pick(realm=realm, exclude=exclude, model=model,
-                            page=None if whole_pool_page else page,
-                            allowed=allowed)
+        account = self.pick(realm=realm, exclude=exclude, model=model, page=page,
+                            allowed=allowed, scope=scope)
         if account is None and page is not None:
             # The page has nobody usable right now. Serving the conversation
             # from outside it beats not serving it at all.
             account = self.pick(realm=realm, exclude=exclude, model=model,
-                                allowed=allowed)
+                                allowed=allowed, scope=scope)
         # A page conversation is not bound on purpose: its rotation is what keeps
         # every account of the page warm, and a binding would pin it back to one
         # (the state it was released from). The page cursor carries its rotation.
-        if account and session_key and (page is None or whole_pool_page):
+        if account and session_key and page is None:
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None):
+    def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None,
+             scope=None):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if scope is not None:
+            snapshot = [a for a in snapshot if wb_pool_scope.in_scope(a, scope)]
         if allowed is not None:
             snapshot = [a for a in snapshot if a.uid in allowed]
         if page is not None:
@@ -5187,11 +5187,20 @@ class AccountPool(object):
                 return account
         return None
 
-    def representative(self, realm=None):
+    def representative(self, realm=None, scope=None):
+        """Pick one account to speak for the pool (display, catalog fetches).
+
+        `scope` 把候选限定在某个号池：目录 / 模型列表这类文本侧元数据请求必须
+        用文本号池的代表号，否则会拿一个媒体号去请求文本侧接口。
+        """
         with self._lock:
             candidates = [a for a in self.accounts if not realm or a.realm == realm]
+            if scope is not None:
+                candidates = [a for a in candidates
+                              if wb_pool_scope.in_scope(a, scope)]
             for account in candidates:
-                if account.access_token: return account
+                if account.access_token:
+                    return account
             return candidates[0] if candidates else None
 
     def find_unique(self, ref):
