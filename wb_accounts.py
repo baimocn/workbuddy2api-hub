@@ -986,6 +986,15 @@ class Account(object):
         # 只做精确匹配不做前缀：行为可预期，不会误伤同前缀的其他模型。
         raw_deny = data.get("disabledModels")
         self.disabled_models = normalise_disabled_models(raw_deny)
+        # 号池归属：text=只跑文本模型，media=只跑图片/视频。老账号无字段时
+        # 按「是否禁用了文本模型」推断，新账号由面板/批量接口显式设置。
+        ps = data.get("poolScope")
+        if ps in ("text", "media"):
+            self.pool_scope = ps
+        elif raw_deny:
+            self.pool_scope = "media"
+        else:
+            self.pool_scope = "text"
         # Live error state, never restored from the credential file: the label
         # describes the last upstream answer, not the credential. It used to be
         # persisted and read back, so a 429 that had long since recovered came
@@ -1186,6 +1195,7 @@ class Account(object):
             "note": self.note,
             "group": self.group,
             "disabledModels": list(self.disabled_models),
+            "poolScope": self.pool_scope,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             # 持久化：上游风控限制按小时到工作日计，重启后仍然成立（见
@@ -1269,6 +1279,7 @@ class Account(object):
             "note": self.note,
             "group": self.group,
             "disabledModels": list(self.disabled_models),
+            "poolScope": self.pool_scope,
             "source": self.source,
             "apiKey": bool(self.is_api_key),
             "credentialMask": self.credential_mask(),
@@ -4735,6 +4746,31 @@ class AccountPool(object):
                     self.log("account %s model %s resumed: daily token limit "
                              "cleared" % (str(account.uid)[:8], mid))
         return values
+
+    def set_pool_scope(self, uid, scope):
+        """设置账号号池归属（text / media），落盘并回公共视图。"""
+        if scope not in ("text", "media"):
+            return None
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.pool_scope = scope
+        account.save(self.dir)
+        return account.public()
+
+    def set_pool_scope_many(self, uids, scope):
+        """批量挪池：返回被成功移动的 uid 列表。"""
+        if scope not in ("text", "media"):
+            return None
+        moved = []
+        for uid in uids:
+            account = self.get(uid)
+            if account is None:
+                continue
+            account.pool_scope = scope
+            account.save(self.dir)
+            moved.append(uid)
+        return moved
 
     def set_proxy_slot(self, uid, slot_id):
         account = self.get(uid)

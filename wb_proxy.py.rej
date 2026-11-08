@@ -1,0 +1,100 @@
+--- /tmp/up_v1_proxy.py	2026-11-08 20:51:22.508923500 +0800
++++ /d/Desktop/wb-pr-material/server_wb_proxy.py	2026-11-08 20:51:02.872086800 +0800
+@@ -16204,10 +16244,12 @@
+     # this realm has a persisted upstream 6004 cap for this free model. The
+     # switch is opt-in because the retry can incur real charges.
+     paid_model = _FREE_MODEL_CREDIT_FALLBACKS.get((realm, model))
+-    eligible = ([a for a in POOL.accounts
++    # 「全部账号都撞了额度上限」只在文本号池里判定：媒体号根本不会跑这个
++    # 免费文本模型的额度，把它算进来会让付费回退永远等不到条件成立。
++    eligible = ([a for a in TEXTS.accounts()
+                  if a.realm == realm and a.enabled and a.access_token
+                  and (allowed_accounts is None or a.uid in allowed_accounts)]
+-                if POOL else [])
++                if TEXTS else [])
+     if (allow_credit_fallback and paid_model and _free_model_credit_fallback_enabled()
+             and eligible and all(a.cap_until(model) > time.time() for a in eligible)):
+         paid_payload = dict(payload)
+@@ -23831,8 +23944,11 @@
+         if realm not in ("intl", "cn"):
+             realm = CURRENT_REALM
+         model = payload.get("model") or TEST_MODEL_DEFAULT
++        # 一键测试 = 每个账号打一条文本请求，所以只测文本号池的号；媒体号池的
++        # 账号在这条路径上整批跳过（面板文案另说，别让它变成漏点）。
+         targets = [a for a in (POOL.accounts if POOL else [])
+-                   if a.realm == realm and a.enabled]
++                   if a.realm == realm and a.enabled
++                   and (TEXTS is None or TEXTS.allows(a))]
+         started = time.time()
+         network = probe_local_network(realm)
+         rows = []
+@@ -23900,6 +24016,15 @@
+                 return self._error(404, "no such account")
+             log("account %s note set (%d chars)"
+                 % (uid[:8], len(updated.get("note") or "")))
++        if "poolScope" in payload:
++            # 号池归属：text = 文本号池，media = 媒体号池。这是把账号从一个
++            # 号池挪到另一个号池的唯一入口，切换立即生效（选号每次都读账号字段）。
++            updated = POOL.set_pool_scope(uid, payload.get("poolScope"))
++            if updated is None:
++                return self._error(
++                    400, "poolScope must be 'text' or 'media', and the account must exist")
++            log("account %s pool scope set to %s"
++                % (uid[:8], updated.get("poolScope")))
+         if "disabledModels" in payload:
+             # 人工黑名单：这些模型不再派给该账号，其他模型与别的账号都不受影响。
+             # 传空数组 = 清空禁用。
+@@ -23913,11 +24038,25 @@
+             return self._error(
+                 400,
+                 "nothing to update: pass 'enabled', 'tasksEnabled', 'proxy', "
+-                "'proxySlot', 'weight' or 'note'"
++                "'proxySlot', 'weight', 'note', 'poolScope' or 'disabledModels'"
+             )
+         return self._json_panel(200, {"account": updated})
+ 
+     def _route_accounts_set_all(self, payload):
++        # 批量把账号挪到某个号池：传 {uids: [...], poolScope: "media"}。不带
++        # uids 时对全部账号生效——导入一批画图号之后一次全划过去最省事。
++        if "poolScope" in payload:
++            scope = payload.get("poolScope")
++            uids = payload.get("uids")
++            if uids is None:
++                uids = [a.uid for a in POOL.accounts]
++            if not isinstance(uids, list):
++                return self._error(400, "uids must be a list")
++            done = POOL.set_pool_scope_many(uids, scope)
++            if done is None:
++                return self._error(400, "poolScope must be 'text' or 'media'")
++            log("pool scope: %d account(s) moved to %s" % (len(done), scope))
++            return self._json_panel(200, {"accounts": account_views(), "moved": len(done)})
+         POOL.set_all_enabled(bool(payload.get("enabled")))
+         return self._json_panel(200, {"accounts": account_views()})
+ 
+@@ -24787,14 +24933,24 @@
+             return
+         if is_account_route:
+             return self._handle_accounts(path, payload)
++        if is_media_route:
++            # 媒体路由**不套**文本侧的模型别名 / 后台模型别名：那两张表是为
++            # 对话客户端准备的，套到画图请求上会把一个媒体模型名改写成文本
++            # 模型名，等于让媒体号池的请求打到文本模型上——正是这次分区要
++            # 掐断的那条路。媒体模型名原样透传，由媒体目录去校验。
++            return self._handle_media_post(path, payload)
+         try:
+             aliases = wb_settings.model_aliases(ACCOUNTS_DIR)
+         except Exception:
+             aliases = {}
+         _apply_model_aliases(payload, aliases)
+         _apply_background_model_alias(payload)
+-        if is_media_route:
+-            return self._handle_media_post(path, payload)
++        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_TEXT):
++            # 媒体入口不服务任何文本模型：在选号之前就拒绝，避免「没有可用账号」
++            # 这种含糊的 503 让人以为是号挂了。
++            return self._error(
++                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
++                "pool_boundary")
+         _apply_deepseek_flash_target(payload, self._request_realm() or CURRENT_REALM)
+         # Check per-key concurrency limit (#359)
+         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)

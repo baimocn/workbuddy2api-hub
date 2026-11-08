@@ -5678,6 +5678,14 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
     <div class="tb-group tb-bulk">
     <button class="sec" onclick="autoAssignSlots(this)" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">一键分配代理</button>
     <button class="sec" id="btnProductAll" onclick="cycleAllProducts(this)" title="把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI">一键切换所有出站身份：<span id="productAllLabel">WB</span></button>
+    <div class="tb-group">
+    <button class="sec" id="pfText" onclick="poolFilter('text', this)">文本号池</button>
+    <button class="sec" id="pfMedia" onclick="poolFilter('media', this)">媒体号池</button>
+    <button class="sec" id="pfAll" onclick="poolFilter('all', this)">全部</button>
+    <span id="batchPoolCount" style="font-size:12px;color:var(--dim);align-self:center">未勾选</span>
+    <button class="sec" id="batchToMedia" onclick="batchPoolScope('media', this)" title="把勾选的账号批量移入媒体号池（只跑图片/视频）" disabled>勾选移入媒体池</button>
+    <button class="sec" id="batchToText" onclick="batchPoolScope('text', this)" title="把勾选的账号批量移回文本号池（恢复文本模型）" disabled>勾选移回文本池</button>
+    </div>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
     <button class="sec" onclick="setCurrentGroup(true, this)">当前分组启用</button>
@@ -10909,7 +10917,15 @@ function accountRow(a){
     + '<td style="text-align:center;white-space:nowrap" data-label="版本">' + realmBadge + tierBadgeBlock + '</td>'
     + '<td style="text-align:left" data-label="账号">'
     // 账号名（大一号）+ 备注 chip 同一行；备注从独立一行收进账号后面。
-    +   '<div class="acct-name-row">'
+    +   '<input type="checkbox" class="acct-sel" data-uid="' + uidAttr + '"'
+    +   ' onchange="updateBatchPoolBar()" onclick="event.stopPropagation()"'
+    +   ' style="vertical-align:middle;margin-right:6px" title="勾选后可用上方按钮批量挪号池">'
+    +   '<span class="badge mini' + ((a.poolScope==='media')?' warn':'') + '"'
+    +   ' style="cursor:pointer;margin-left:6px"'
+    +   ' title="号池：文本号池只跑对话，媒体号池只跑图片/视频。点一下切换"'
+    +   ' onclick="toggleAccountPoolScope(&quot;' + uidAttr + '&quot;,' + ((a.poolScope==='media')?'false':'true') + ')">'
+    +   ((a.poolScope==='media')?'媒体号池':'文本号池') + '</span>'
+    +   '<div class="acct-name-row">' 
     +     '<span class="acct-name" title="' + esc(a.nickname) + '">' + esc(a.nickname) + '</span>'
     // 静态 API Key 账号：没有登录身份，也没有签到/成长体系，标出来省得当成
     // 普通 OAuth 号去点「重新登录」。悬停给出脱敏后的凭证，方便对上是哪一把。
@@ -11407,6 +11423,8 @@ function renderAccounts(){
   const box = document.getElementById('accounts');
   const currentView = (window.VIEW_REALM || "intl");
   let list = accountsInView();
+  // 号池过滤：文本/媒体分层显示（POOL_FILTER 由上方 Tab 按钮控制）。
+  if(POOL_FILTER !== 'all') list = list.filter(a => (a.poolScope || 'text') === POOL_FILTER);
   const skipIfSame = arguments[0] === true;
   if(ACCT_PAGE_REALM !== currentView){ ACCT_PAGE_REALM = currentView; ACCT_PAGE = 1; }
   const filterKey = ACCOUNT_FILTERS.query + '\u0001' + ACCOUNT_FILTERS.status
@@ -11582,6 +11600,56 @@ async function toggleAccount(uid, enable, btn){
     toast('操作失败: ' + e.message, 'bad');
   }finally{
     if(btn) btn.disabled = false;
+  }
+}
+// ── 号池分层：过滤 / 批量挪池 / 单号切换 ──────────────────────────
+let POOL_FILTER = 'all';
+function poolFilter(scope, btn){
+  POOL_FILTER = scope;
+  ['pfText','pfMedia','pfAll'].forEach(function(id){
+    const b = document.getElementById(id);
+    if(b) b.classList.toggle('active', b === btn);
+  });
+  renderAccounts();
+}
+function acctSelUids(){
+  return Array.from(document.querySelectorAll('#accounts .acct-sel:checked')).map(function(x){return x.dataset.uid;});
+}
+function updateBatchPoolBar(){
+  const n = acctSelUids().length;
+  const el = document.getElementById('batchPoolCount');
+  if(el) el.textContent = n ? ('已选 ' + n + ' 个') : '未勾选';
+  ['batchToMedia','batchToText'].forEach(function(id){
+    const b = document.getElementById(id);
+    if(b) b.disabled = !n;
+  });
+}
+function toggleAcctSelAll(on){
+  document.querySelectorAll('#accounts .acct-sel').forEach(function(x){ x.checked = on; });
+  updateBatchPoolBar();
+}
+async function batchPoolScope(scope, btn){
+  const uids = acctSelUids();
+  if(!uids.length){ toast('先勾选要挪池的账号', 'warn'); return; }
+  if(btn) btn.disabled = true;
+  try{
+    const r = await postJSON('/accounts/set-all', {uids: uids, poolScope: scope});
+    toast('已把 ' + (r.moved || uids.length) + ' 个账号移入' + (scope === 'media' ? '媒体' : '文本') + '号池', 'ok');
+    await loadAccounts();
+  }catch(e){
+    toast('批量挪池失败: ' + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
+async function toggleAccountPoolScope(uid, toMedia){
+  const scope = toMedia ? 'media' : 'text';
+  try{
+    await postJSON('/accounts/set', {uid: uid, poolScope: scope});
+    await loadAccounts();
+    toast(toMedia ? '已移入媒体号池（只跑图片/视频）' : '已移回文本号池', 'ok');
+  }catch(e){
+    toast('切换号池失败: ' + e.message, 'bad');
   }
 }
 async function toggleAccountTasks(uid, enable){
