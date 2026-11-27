@@ -637,6 +637,30 @@ try:
                              "busy_wait_seconds": C.BUSY_WAIT_SECONDS})
     acct.models = models_before
 
+    print("== connection-layer error does not cool the account ==")
+    # 连接层错误（Connection reset / TLS BAD_RECORD_MAC / Remote end closed）
+    # 说明链路此刻不通，不是账号坏了。旧实现 note_error(soft=True) 会把它
+    # 记成 60 秒账号冷却；现在只留痕并换下一个号。
+    acct.models = models_before
+    with mock.patch.object(
+            C, "_client_chat",
+            side_effect=C.CodeArtsUnavailable("Connection reset by peer")):
+        try:
+            C.open_chat(C.load_config(ACCOUNTS), {"model": "GLM-5.2"},
+                        "sess-net-down")
+            net_error = None
+        except Exception as exc:  # noqa: BLE001
+            net_error = exc
+    check("connection error surfaces as CodeArtsUnavailable",
+          isinstance(net_error, C.CodeArtsUnavailable),
+          type(net_error).__name__)
+    check("connection error does not set a cooldown",
+          acct.cool_until == 0, acct.cool_until)
+    check("connection error does not bump err_count",
+          acct.err_count == 0, acct.err_count)
+    check("connection error is recorded on the account",
+          "Connection reset" in str(acct.last_error or ""), acct.last_error)
+
     print("== credit exhausted cooldown ==")
     credit_message = (
         "您的积分已耗尽，请关注活动积分领取活动或者[升级套餐]"

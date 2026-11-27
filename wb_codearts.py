@@ -17,11 +17,13 @@
 依赖：Python 3.9+ 标准库；密码学原语在 `wb_codearts_crypto.py`。
 """
 
+import http.client
 import io
 import json
 import os
 import secrets
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -2337,6 +2339,16 @@ def _client_chat(acct, body, session_key):
                     time.sleep(2.0 * (attempt + 1))
                     continue
             raise
+        except (ssl.SSLError, socket.timeout, TimeoutError, ConnectionError,
+                OSError, http.client.HTTPException) as exc:
+            # 握手成功但流内首包也可能是连接层异常（SSLV3_ALERT_BAD_RECORD_MAC /
+            # IncompleteRead / RemoteDisconnected 常发生在读完 200 响应头之后）。
+            # 这一层以前是裸 `except Exception: stream.close(); raise`，异常直接
+            # 冒到上层变成 500：既不换号也不留痕。归到 CodeArtsUnavailable 之后
+            # 走正常的「换下一个号」路径，且不会把账号打进冷却。
+            stream.close()
+            raise CodeArtsUnavailable(
+                "CodeArts 响应流中断：%s" % (exc or type(exc).__name__)) from None
         except Exception:
             stream.close()
             raise
@@ -2441,7 +2453,12 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             exclude.add(acct.uid)
             last_error = exc
         except CodeArtsUnavailable as exc:
-            pool.note_error(acct, str(exc), soft=True)
+            # 连接层错误（Connection reset / TLS BAD_RECORD_MAC / Remote end
+            # closed）说的是「本机到华为云的这条链路此刻不通」，不是「这个号
+            # 坏了」。旧实现把它当账号级软错误打 60 秒冷却，一次网络抖动就能
+            # 让整池账号轮着封一遍。现在只留痕不冷却：换下一个号继续试，失败
+            # 的号立刻回到候选。真正的账号级惩罚留给上游业务错误。
+            acct.last_error = str(exc)[:200]
             pool.release(acct)
             exclude.add(acct.uid)
             last_error = exc
