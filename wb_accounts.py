@@ -1988,6 +1988,10 @@ class Account(object):
                      ("余额保护", self.balance_until), ("软限流冷却", self.cooldown_until)]
         if model:
             penalties.append(("模型 %s 冷却" % model, self.model_cooldowns.get(model, 0.0)))
+        if model and self.model_is_free(model):
+            # 免费模型不吃余额保护（与 throttle_wait 同口径），否则诊断串会说
+            # 「余额保护剩余 12h」，而它其实能调。
+            penalties = [p for p in penalties if p[0] != "余额保护"]
         label, until = max(penalties, key=lambda item: item[1])
         if until > now:
             # 剩余时间要精确到秒：还剩 42 秒时写「0 min」，读起来就是「已经该能用
@@ -4052,13 +4056,22 @@ class Account(object):
             self.token_expired = False
 
     def throttle_wait(self, model=None):
-        """Seconds until this account can serve `model` again (0 = right now)."""
+        """Seconds until this account can serve `model` again (0 = right now).
+
+        余额保护（balance_until）只拦付费模型：它记的是「上游说账户积分用尽」，
+        而免费模型（credits x0.00）根本不花积分，上游对它们照常接单。把整账号
+        一起封掉会让「0 积分账号 + 免费模型」这个完全合法的组合在额度耗尽后
+        整整哑到次日重置。
+        """
         if self.account_banned or not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
+        balance_park = self.balance_until
+        if model and self.model_is_free(model):
+            balance_park = 0.0
         with self._throttle_lock:
             wait = max(0.0, self.cooldown_until - now,
-                       self.balance_until - now, self.breaker_until - now,
+                       balance_park - now, self.breaker_until - now,
                        self.degrade_until - now)
             if model:
                 wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))

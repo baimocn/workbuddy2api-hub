@@ -19,6 +19,7 @@ No network: both remote-catalogue readers are stubbed in every test.
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -208,6 +209,118 @@ class ReserveExemptsFreeModelTests(unittest.TestCase):
         account = self.make_account(1)
         account.reserve_credits = 0
         self.assertFalse(account.reserve_blocked("deepseek-v4.1-flash"))
+
+
+class BalanceGuardExemptsFreeModelTests(unittest.TestCase):
+    """余额保护（balance_until）只拦付费模型。
+
+    上游说「账户积分用尽」时会把账号 park 到次日重置。但免费模型
+    （credits x0.00）不花积分，上游对它们照常接单；把整账号一起封掉会让
+    「0 积分账号 + 免费模型」这个合法组合整整哑到次日 04:00。
+    """
+
+    def make_account(self, free_models=None):
+        account = wb_accounts.Account({
+            "uid": "uid-balance-free-test",
+            "accessToken": "tok-test",
+            "realm": "cn",
+            "credits": {"remain": 0, "used": 100, "size": 100},
+        })
+        if free_models is not None:
+            account.free_models = frozenset(free_models)
+        return account
+
+    def test_free_model_ignores_the_balance_park(self):
+        account = self.make_account(["hy4flash-free"])
+        account.balance_until = time.time() + 3600
+        self.assertEqual(account.throttle_wait("hy4flash-free"), 0.0)
+        self.assertEqual(account.throttle_wait("Hy4Flash-FREE"), 0.0)
+
+    def test_paid_model_still_respects_the_balance_park(self):
+        account = self.make_account(["hy4flash-free"])
+        account.balance_until = time.time() + 3600
+        self.assertGreater(account.throttle_wait("deepseek-v4.1-flash"), 3000)
+
+    def test_unconfirmed_free_name_does_not_bypass_the_balance_park(self):
+        account = self.make_account(["hy4flash-free"])
+        account.balance_until = time.time() + 3600
+        self.assertGreater(account.throttle_wait("made-up-free"), 3000)
+
+    def test_diagnostic_string_hides_the_balance_park_for_a_free_model(self):
+        account = self.make_account(["hy4flash-free"])
+        account.balance_until = time.time() + 3600
+        self.assertEqual(account.unavailable_reason("hy4flash-free"), "")
+        self.assertIn("余额保护", account.unavailable_reason("deepseek-v4.1-flash"))
+
+
+class PublishFreeModelsTests(unittest.TestCase):
+    """publish_free_models() 必须把名单真的推到账号层。
+
+    旧代码只在 reserve 护栏打开时（apply_reserve_credits 的 on 分支）才推，
+    本地 reserve=0 的部署因此每个账号 free_models 都是空集，余额保护把
+    hy4flash-free 一并拦掉。
+    """
+
+    def setUp(self):
+        P._free_models_cache.update({"at": 0.0, "data": None})
+        P._FREE_MODELS_PUBLISHED["sig"] = None
+        self._orig_live = (dict(P._models_cache), dict(P._catalog_meta))
+        self._orig_cached = P.read_cached_remote_catalog
+        P.read_cached_remote_catalog = lambda realm: None
+        P._models_cache["intl"] = {"at": 0.0, "data": []}
+        P._models_cache["cn"] = {"at": 0.0, "data": []}
+
+    def tearDown(self):
+        P._models_cache.clear()
+        P._models_cache.update(self._orig_live[0])
+        P._catalog_meta.clear()
+        P._catalog_meta.update(self._orig_live[1])
+        P.read_cached_remote_catalog = self._orig_cached
+        P._free_models_cache.update({"at": 0.0, "data": None})
+
+    def test_publish_pushes_the_free_list_even_with_reserve_off(self):
+        account = wb_accounts.Account({
+            "uid": "uid-publish-free-test",
+            "accessToken": "tok-test",
+            "realm": "cn",
+            "credits": {"remain": 0, "used": 100, "size": 100},
+        })
+        with tempfile.TemporaryDirectory(prefix="wb-publish-pool-") as directory:
+            pool = wb_accounts.AccountPool(directory, log=lambda _m: None)
+            pool.accounts = [account]
+            orig_pool = P.POOL
+            orig_dir = P.ACCOUNTS_DIR
+            P.POOL = pool
+            P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+            try:
+                P.publish_free_models(force=True)
+            finally:
+                P.POOL = orig_pool
+                P.ACCOUNTS_DIR = orig_dir
+        self.assertIn("hy4flash-free", account.free_models)
+        self.assertIn("hy3", account.free_models)
+
+    def test_second_publish_is_a_no_op_without_a_signature_change(self):
+        calls = []
+
+        class FakePool(object):
+            accounts = []
+
+            def apply_reserve_credits(self, values, free):
+                calls.append(free)
+
+        orig_pool = P.POOL
+        orig_dir = P.ACCOUNTS_DIR
+        P.POOL = FakePool()
+        P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+        try:
+            P.publish_free_models(force=True)
+            P.publish_free_models()
+            P.publish_free_models()
+        finally:
+            P.POOL = orig_pool
+            P.ACCOUNTS_DIR = orig_dir
+        self.assertEqual(len(calls), 1, len(calls))
 
 
 if __name__ == "__main__":

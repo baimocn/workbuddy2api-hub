@@ -3085,13 +3085,36 @@ def apply_daily_credit_limit(refresh=False):
     return POOL.apply_daily_credit_limit(limits, credits, free_models)
 
 
-def apply_reserve_credits(refresh=False):
-    """Publish the reserve and, only when it is on, the realm free ids.
+_FREE_MODELS_PUBLISHED = {"sig": None}
 
-    This reuses the existing 60-second local catalogue cache; it never folds
-    usage logs or adds network work. The settings-save path passes refresh=True
-    so switching the guard off also clears the in-memory threshold.
+
+def publish_free_models(force=False):
+    """把「每个出口的免费模型名单」推给账号层。
+
+    账号层用它判断某个模型是否免费，从而在**余额保护**（积分耗尽的 park）上
+    放行——0 积分账号仍然能跑 hy4flash-free。
+
+    只在名单变化（或 force）时下推：签名比较是一次集合运算，比每次请求都动
+    一次池便宜得多，也让只跑 CodeArts 的部署完全不碰 WorkBuddy 池。
     """
+    if POOL is None:
+        return
+    free = free_models_by_realm()
+    sig = tuple((realm, tuple(sorted(ids or ())))
+                for realm, ids in sorted((free or {}).items()))
+    if not force and sig == _FREE_MODELS_PUBLISHED["sig"]:
+        return
+    try:
+        POOL.apply_reserve_credits(
+            wb_settings.limit_values(ACCOUNTS_DIR, "reserve_credits"), free)
+        _FREE_MODELS_PUBLISHED["sig"] = sig
+    except Exception as exc:
+        log("could not publish free models: %s" % exc, level="WARN",
+            tag="pool")
+
+
+def apply_reserve_credits(refresh=False):
+    """Publish the reserve guard (and, when on, the realm free ids)."""
     if POOL is None:
         return 0
     values = wb_settings.limit_values(ACCOUNTS_DIR, "reserve_credits")
@@ -31280,6 +31303,10 @@ def _bootstrap_runtime(args):
     POOL.apply_proxy_slots()
     _bind_pools()
     apply_reserve_credits()
+    # 免费模型名单必须显式下推一次：reserve 护栏关着时 apply_reserve_credits
+    # 会提前返回，账号层的 free_models 就永远是空集，余额保护会把 hy4flash-free
+    # 这类 0 积分模型一起拦掉（重启后必现）。
+    publish_free_models(force=True)
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.
