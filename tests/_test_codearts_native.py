@@ -786,6 +786,68 @@ try:
     check("overview accounts", len(ov["accounts"]) >= 1, ov)
     check("overview models", len(ov["models"]) >= 1, ov)
     check("health enabled", C.health(C.load_config(ACCOUNTS))["ok"] is True)
+    print("== account x model availability ==")
+    # 一条「无权调用该模型」只该标记 (账号, 模型)，绝不冷却整个账号。
+    acct.cool_until = 0
+    acct.err_count = 0
+    acct.model_unusable.clear()
+    state.embedded_error = {"error_msg": "您当前无权调用该模型，请联系企业管理员开通。",
+                            "error_code": "TM.000010051"}
+    body = C.build_chat_body({"model": "GLM-5.2",
+                              "messages": [{"role": "user", "content": "hi"}],
+                              "stream": False}, "sess-no-model")
+    try:
+        C.open_chat(C.load_config(ACCOUNTS), body, "sess-no-model")
+        no_model_error = None
+    except Exception as exc:  # noqa: BLE001
+        no_model_error = exc
+    check("model permission error is reported",
+          no_model_error is not None
+          and "无法调用模型" in str(no_model_error), no_model_error)
+    check("model permission error does not cool the account",
+          acct.cool_until == 0, acct.cool_until)
+    check("model permission error does not bump err_count",
+          acct.err_count == 0, acct.err_count)
+    check("model permission error marks the (account, model) pair",
+          not acct.model_usable("GLM-5.2")
+          and acct.model_unusable_reason("GLM-5.2") == "当前账号无权调用该模型",
+          acct.model_unusable)
+    check("a different model on the same account stays usable",
+          acct.model_usable("kimi-k3"), acct.model_unusable)
+    check("model_entries hides the model when no account can serve it",
+          all(item["id"] != "GLM-5.2"
+              for item in C.model_entries(C.load_config(ACCOUNTS))),
+          [item["id"] for item in C.model_entries(C.load_config(ACCOUNTS))])
+
+    # 真实请求成功应清掉历史结论。先清空标记，让请求能真正发出去；
+    # 成功返回后 mark_model_usable 会保证结论表是干净的（幂等）。
+    state.embedded_error = None
+    acct.model_unusable.clear()
+    stream, _acct, _model = C.open_chat(C.load_config(ACCOUNTS), body,
+                                        "sess-no-model-ok")
+    b"".join(stream)
+    stream.close()
+    check("a successful call clears the stale conclusion",
+          acct.model_usable("GLM-5.2"), acct.model_unusable)
+
+    # TTL 过期后结论自动失效
+    acct.model_unusable.clear()
+    acct.mark_model_unusable("GLM-5.2", "当前账号无权调用该模型")
+    past = time.time() - C.DEFAULTS["model_unusable_ttl_seconds"] - 1
+    acct.model_unusable["glm-5.2"] = ("当前账号无权调用该模型", past)
+    check("an expired conclusion is ignored", acct.model_usable("GLM-5.2"))
+
+    # 结论要能落盘并在重启后恢复
+    acct.mark_model_unusable("kimi-k3", "模型未在当前账号注册")
+    C.pool_for(ACCOUNTS).save_state()
+    C.invalidate_pool(ACCOUNTS)
+    fresh = C.pool_for(ACCOUNTS).get(acct.uid)
+    check("conclusions survive a pool reload",
+          fresh is not None and not fresh.model_usable("kimi-k3"),
+          fresh.model_unusable if fresh else None)
+    fresh.model_unusable.clear()
+    C.pool_for(ACCOUNTS).save_state()
+
 finally:
     stop_server(srv)
 

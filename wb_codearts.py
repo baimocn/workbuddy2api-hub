@@ -129,6 +129,9 @@ DEFAULTS = {
     "busy_wait_seconds": BUSY_WAIT_SECONDS,
     "benefit_auto_claim": True,
     "credits_auto_claim": False,
+    # 「账号 × 模型」不可用结论的有效期：套餐/福利轮换后结论自然过期，
+    # 不需要人工清（移植自 codearts2api 的 availability.go，原值 30 分钟）。
+    "model_unusable_ttl_seconds": 1800.0,
 }
 
 #: Verified with the upstream validation error: reasoning_effort must be one of
@@ -263,6 +266,9 @@ def load_config(accounts_dir):
             0.0, 120.0),
         "benefit_auto_claim": raw.get("benefit_auto_claim", True) is not False,
         "credits_auto_claim": raw.get("credits_auto_claim", False) is True,
+        "model_unusable_ttl_seconds": _positive_float(
+            raw.get("model_unusable_ttl_seconds"),
+            DEFAULTS["model_unusable_ttl_seconds"], 0.0, 604800.0),
         "accounts_dir": accounts_dir,
     }
 
@@ -305,6 +311,9 @@ def save_config(accounts_dir, patch):
             0.0, 120.0)
         merged["benefit_auto_claim"] = merged.get("benefit_auto_claim", True) is not False
         merged["credits_auto_claim"] = merged.get("credits_auto_claim", False) is True
+        merged["model_unusable_ttl_seconds"] = _positive_float(
+            merged.get("model_unusable_ttl_seconds"),
+            DEFAULTS["model_unusable_ttl_seconds"], 0.0, 604800.0)
         # 重新读 settings：`load_config` 只返回收敛后的 codearts 段，写回去要
         # 保留其它段（api_keys / realm / 媒体配置…），所以必须拿整份再合并。
         data = wb_settings.load(accounts_dir)
@@ -455,6 +464,14 @@ class CodeArtsAccount(object):
         self.last_used = 0.0
         self.models = []
         self.model_benefit = {}
+        # 「账号 × 模型」可用性结论（移植自 codearts2api 的 availability.go）。
+        # 上游 /v1/models 的发现结果是各账号并集，会把别的账号才有的模型也列进
+        # 当前账号；以前这类「无权调用该模型」被当成账号级错误，每个号记 3 次
+        # 就冷却 10 分钟，一条错模型名能把整池打死。现在按 (账号, 模型) 单独
+        # 记结论、不连坐账号：
+        #   model_unusable[model_lower] = (reason, at)
+        # 结论在 model_unusable_ttl_seconds 内有效；该模型真实请求成功会反向清除。
+        self.model_unusable = {}
         self.models_fetched_at = 0.0
         self.checkin = None
         self.note = ""
@@ -614,6 +631,40 @@ class CodeArtsAccount(object):
             return True  # 目录还没发现，先给它一次机会
         return any(str(m.get("id") or "").lower() == mid for m in self.models)
 
+    def model_usable(self, model, now=None):
+        """这个号此刻能不能调这个模型。
+
+        比 has_model() 多一层「实战结论」：目录里有、但上游明确答过无权调用 /
+        未注册 / 福利未领取的 (账号, 模型) 组合，在 TTL 内直接判不可用，省掉
+        一次必然失败的上游往返，也避免那条失败把整个账号拖进冷却。
+        """
+        mid = str(model or "").strip().lower()
+        if not mid:
+            return True
+        entry = self.model_unusable.get(mid)
+        if not entry:
+            return True
+        now = now or time.time()
+        ttl = self.pool.config.get("model_unusable_ttl_seconds",
+                                   DEFAULTS["model_unusable_ttl_seconds"])
+        return now - float(entry[1]) >= float(ttl)
+
+    def model_unusable_reason(self, model):
+        mid = str(model or "").strip().lower()
+        entry = self.model_unusable.get(mid) or ("", 0.0)
+        return str(entry[0] or "")
+
+    def mark_model_unusable(self, model, reason):
+        mid = str(model or "").strip().lower()
+        if not mid:
+            return
+        self.model_unusable[mid] = (str(reason or "")[:160], time.time())
+
+    def mark_model_usable(self, model):
+        mid = str(model or "").strip().lower()
+        if mid:
+            self.model_unusable.pop(mid, None)
+
     def is_benefit(self, model):
         return bool(self.model_benefit.get(str(model or "").lower()))
 
@@ -663,6 +714,20 @@ class CodeArtsPool(object):
             acct.tasks_enabled = bool(entry.get("tasks_enabled", True))
             if isinstance(entry.get("checkin"), dict):
                 acct.checkin = entry["checkin"]
+            # 「账号 × 模型」不可用结论：持久化后重启仍然生效，但过期条目
+            # 直接丢掉，避免把很久以前的套餐结论带到今天。
+            raw_unusable = entry.get("model_unusable")
+            if isinstance(raw_unusable, dict):
+                cutoff = time.time() - float(self.config.get(
+                    "model_unusable_ttl_seconds",
+                    DEFAULTS["model_unusable_ttl_seconds"]))
+                for mid, val in raw_unusable.items():
+                    try:
+                        reason, at = (val or ("", 0.0))[0], float((val or ("", 0.0))[1])
+                    except Exception:
+                        continue
+                    if at >= cutoff:
+                        acct.model_unusable[str(mid).lower()] = (str(reason)[:160], at)
             accounts.append(acct)
         with self._lock:
             self.accounts = accounts
@@ -701,6 +766,8 @@ class CodeArtsPool(object):
                 "checkin": acct.checkin,
                 "note": acct.note,
                 "tasks_enabled": bool(acct.tasks_enabled),
+                "model_unusable": {mid: [reason, at]
+                                   for mid, (reason, at) in acct.model_unusable.items()},
             })
         try:
             _atomic_write(self.state_file, items)
@@ -862,11 +929,13 @@ class CodeArtsPool(object):
             if uid and uid not in exclude and (allowed_accounts is None or uid in allowed_accounts):
                 acct = self.get(uid)
                 if acct and acct.healthy(now) and acct.has_model(model) \
+                        and acct.model_usable(model, now) \
                         and acct.active_concurrent < acct.max_concurrent:
                     return acct
         candidates = [a for a in accounts
                       if a.uid not in exclude and (allowed_accounts is None or a.uid in allowed_accounts) and a.healthy(now)
-                      and a.active_concurrent < a.max_concurrent]
+                      and a.active_concurrent < a.max_concurrent
+                      and a.model_usable(model, now)]
         capable = [a for a in candidates if a.has_model(model)]
         pool = capable or candidates
         if not pool:
@@ -1529,6 +1598,10 @@ def model_entries(config):
              "benefit": mid.lower() in {m.lower() for m in SEED_BENEFIT_MODELS},
              "supports_images": _known_vision(mid)}
             for mid in SEED_MODELS])])
+    if pool.accounts:
+        # 一个模型只要还有账号没被标记为「不可用」，就继续列出。
+        merged = [item for item in merged
+                  if any(acct.model_usable(item["id"]) for acct in pool.accounts)]
     now = int(time.time())
     out = []
     for item in merged:
@@ -2172,6 +2245,23 @@ def _ensure_token(acct, force=False, failed_token=None):
         acct.update_auth(token)
 
 
+def _model_unavailable_reason(message):
+    """把上游错误归类成「这个账号调不了这个模型」；不是这类就返回空串。
+
+    这类失败说的是**账号与模型的关系**，不是账号坏了：记成账号级错误会让
+    整池冷却，所以必须单独识别、只标记那一个 (账号, 模型) 组合。
+    """
+    text = str(message or "")
+    low = text.lower()
+    if "tm.000010051" in low or "无权调用该模型" in text:
+        return "当前账号无权调用该模型"
+    if "inferhub.002002009" in low or "not registered" in low:
+        return "模型未在当前账号注册"
+    if "4004.200" in low or "benefit not found" in low:
+        return "限时福利未领取或已过期"
+    return ""
+
+
 def _is_concurrency_message(message):
     text = str(message or "").lower()
     return ("并发会话" in text or "tm.00001041" in text
@@ -2422,6 +2512,8 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
                     raise first_exc
                 stream, used = _client_chat(acct, body, session_key)
             pool.note_success(acct)
+            # 这个号真的调通了该模型：清掉可能存在的历史「不可用」结论。
+            acct.mark_model_usable(model)
             pool.bind_session(session_key, acct.uid)
             return stream, acct, used
         except CodeArtsBadRequest:
@@ -2434,6 +2526,21 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             exclude.add(acct.uid)
             last_error = exc
         except CodeArtsUpstreamError as exc:
+            # 「这个号调不了这个模型」≠「这个号坏了」：只标记 (账号, 模型)，
+            # 不记账号级错误。否则一条无权的模型名会连累整池冷却 10 分钟，
+            # 连正常模型一起 502。
+            model_reason = _model_unavailable_reason(str(exc))
+            if model_reason:
+                acct.mark_model_unusable(model, model_reason)
+                pool.save_state()
+                pool.release(acct)
+                exclude.add(acct.uid)
+                last_error = CodeArtsUpstreamError(
+                    "账号 %s 无法调用模型 %s：%s"
+                    % (acct.nickname or acct.uid[:8], model, model_reason),
+                    status=getattr(exc, "status", None),
+                    code=getattr(exc, "code", None))
+                continue
             soft = (exc.status == 429 or "429" in str(exc.code or ""))
             cooldown = CREDIT_COOLDOWN if exc.code == "CREDIT_EXHAUSTED" else None
             pool.note_error(acct, str(exc), soft=soft, cooldown=cooldown)
@@ -2466,6 +2573,11 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
                            % (acct.nickname, acct.last_error or "refresh_token 已失效"))
         elif acct.cool_until > now:
             reasons.append("%s 冷却中：%s" % (acct.nickname, acct.last_error or "稍后重试"))
+        elif not acct.model_usable(model):
+            # 账号是健康的，只是这个号没这个模型。单独说清楚，别和「账号全废了」
+            # 混成一句话——客户端据此决定是换模型还是换配置。
+            reasons.append("%s 无此模型权限：%s"
+                           % (acct.nickname, acct.model_unusable_reason(model) or "该模型不可用"))
     if reasons:
         raise CodeArtsUnavailable(
             "没有可用的 CodeArts 账号：" + "；".join(reasons[:2]))
