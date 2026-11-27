@@ -27476,11 +27476,19 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(raw, dict):
                 return self._error(400, "codearts must be an object",
                                    "invalid_request_error")
+            before = wb_codearts.load_config(ACCOUNTS_DIR)
             try:
                 wb_codearts.save_config(ACCOUNTS_DIR, raw)
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
-            wb_codearts.invalidate_models()
+            # 只有模型目录相关的开关变了才清缓存。以前无条件 invalidate_models()，
+            # 调个冷却秒数 / 超时也会把每个账号的模型目录清空，下一次
+            # /v1/models 重新打三路上游发现——纯粹白付上游请求。
+            after = wb_codearts.load_config(ACCOUNTS_DIR)
+            if (before.get("enabled") != after.get("enabled")
+                    or before.get("models_ttl_seconds") != after.get("models_ttl_seconds")
+                    or before.get("benefit_auto_claim") != after.get("benefit_auto_claim")):
+                wb_codearts.invalidate_models()
             wb_codearts.invalidate_overview()
             reply["codearts"] = wb_codearts.masked_config(ACCOUNTS_DIR)
             if reconcile_codearts_realm():
