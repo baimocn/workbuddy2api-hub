@@ -2571,6 +2571,20 @@ def _find_session(session_id=None, ticket_id=None, secret=None):
         return pending[0] if pending else None
 
 
+def _only_pending_session():
+    """当前唯一一个 pending 会话；0 个或多个都返回 None。
+
+    portal 的**首次回调只带 secret + redirect**，既没有 ticket_id 也没有
+    state（实测）。那一刻会话只能靠「同时只可能有一个登录在飞」来确定归属。
+    这里刻意只在**唯一**时认领——两个登录并发时宁可拒绝，也不把 secret 塞进
+    别人的会话。
+    """
+    _gc_oauth()
+    with _OAUTH_LOCK:
+        pending = [s for s in _OAUTH_SESSIONS.values() if s.status == "pending"]
+    return pending[0] if len(pending) == 1 else None
+
+
 class _CredentialHolder(object):
     """只带 credential() 的轻量对象，给 signed_get 查身份用。"""
 
@@ -2685,14 +2699,21 @@ def oauth_poll(config, session_id):
         raise CodeArtsNotFound("会话不存在或已过期，请重新发起授权")
     if session.status in ("done", "error"):
         return session.public()
+    # ticket 轮询只在 portal 已经回调过（ticket_fallback）之后才开始。
+    # 新式 OAuth 的 token 只有带 code 的那次回调才含 refresh_token，提前轮询
+    # 会抢先保存一份**没有 refresh_token 的临时凭证**，账号过一小时就死。
+    # 所以等到 portal 明确给了 secret 再轮，而且必须带 refresh_token 才落盘。
     if session.ticket_fallback:
         try:
             token = poll_ticket(session.ticket_id, session.secret)
         except CodeArtsError as exc:
-            session.status = "error"
-            session.message = str(exc)
+            # 轮询失败大多是「还没授权完」，不要立刻打成 error 终态。
+            session.message = "等待浏览器完成登录…（%s）" % str(exc)[:80]
             return session.public()
-        if token.get("user_id") and token["credentials"]["security_token"]:
+        creds = token.get("credentials") or {}
+        has_refresh = bool(token.get("refresh_token"))
+        if has_refresh and creds.get("security_token") \
+                and (token.get("user_id") or token.get("user_name")):
             _save_login(config, session, token)
         else:
             session.message = "等待浏览器完成登录…"
@@ -2775,6 +2796,14 @@ def oauth_callback_get(config, query):
             session = _find_session(ticket_id=candidate)
             if session is not None:
                 break
+    if session is None and callback_secret and not ticket_id and not state:
+        # portal 的**首次回调只带 secret + redirect**（实测）：既没有 ticket_id
+        # 也没有 state。这次回调里 portal 下发的 secret 是后面轮询
+        # /v1/login/ticket 唯一认的那一份，漏掉它就再也拿不到 token。
+        # 只在「同时只有一个 pending 会话」时认领；并发登录时宁可拒绝。
+        session = _only_pending_session()
+        if session is not None:
+            session.secret = callback_secret
     if session is None:
         return 400, "<h3>登录会话不存在或已过期，请回到看板重新发起。</h3>"
     code = value("code")
@@ -2790,10 +2819,10 @@ def oauth_callback_get(config, query):
             session.secret = secret
             session.ticket_fallback = True
             session.message = "回调已接收，继续等待授权结果…"
-            import html as html_module
-            html = ('<meta http-equiv="refresh" content="0;url=%s">'
-                    '<h3>正在继续华为云授权…</h3>' % html_module.escape(redirect, quote=True))
-            return 200, html
+            # 这里必须是**真正的 3xx 跳转**：portal 的登录链路要求这次回调
+            # 直接 307 回 redirect，用 200 + meta refresh 会让链路停在半路，
+            # 带 code 的第二次回调永远不会到达。
+            return 307, redirect
     except CodeArtsError as exc:
         session.status = "error"
         session.message = str(exc)

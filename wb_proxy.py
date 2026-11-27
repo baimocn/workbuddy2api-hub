@@ -28148,6 +28148,16 @@ class Handler(BaseHTTPRequestHandler):
             status, html = wb_codearts.oauth_callback_get(cfg, query)
         except Exception as exc:
             status, html = 400, "<h3>登录失败：%s</h3>" % exc
+        if status in (301, 302, 303, 307, 308):
+            # portal 的登录链路要求这次回调真的 3xx 跳回 redirect。用
+            # 200 + meta refresh 会把链路停在半路，第二次带 code 的回调
+            # 就不会来了——用户只能手工拼 URL 才能登录。
+            self.send_response(status)
+            self.send_header("Location", html)
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
         raw = ("<!doctype html><meta charset=\"utf-8\"><body style=\"font-family:sans-serif;"
                "padding:32px;line-height:1.7\">" + html + "</body>").encode("utf-8")
         self.send_response(status)

@@ -122,8 +122,36 @@ reset_sessions()
 cfg, started, session = new_session()
 redirect = urllib.parse.quote("https://codearts.huaweicloud.com/portal/x", safe="")
 status, html = call(cfg, "secret=%s&redirect=%s" % (session.secret, redirect))
-check("secret + redirect 形态照旧走「继续授权」",
-      status == 200 and "正在继续华为云授权" in html, (status, html[:160]))
+# 本 PR 把这里从 200 + meta refresh 改成真 307：portal 的登录链路要求
+# 真正的 3xx 跳转，meta refresh 会让链路停在半路。
+check("secret + redirect 形态返回真 3xx 跳转",
+      status == 307 and html == "https://codearts.huaweicloud.com/portal/x",
+      (status, html[:160]))
+
+# --- 9. portal 首次回调只带 secret + redirect（无 ticket_id / state）--------
+# 实测新式 OAuth 的第一次回调就是这个形状：必须认领唯一 pending 会话，
+# 否则链路当场断在 400，带 code 的第二次回调永远不会来。
+reset_sessions()
+cfg, started, session = new_session()
+status, html = call(cfg, "secret=%s&redirect=%s"
+                    % (session.secret, urllib.parse.quote(
+                        "https://codearts.huaweicloud.com/portal/x", safe="")))
+check("只带 secret 时认领唯一 pending 会话",
+      status == 307 and session.ticket_fallback is True, (status, session.ticket_fallback))
+check("认领后 secret 被记到会话上", session.secret == session.secret)
+
+# 并发登录（两个 pending）时必须拒绝，不能猜。
+reset_sessions()
+cfg = C.load_config(ACCOUNTS)
+first = C.oauth_start(cfg, port=8789)
+second = C.oauth_start(cfg, port=8789)
+status, html = call(cfg, "secret=some-secret&redirect=%s"
+                    % urllib.parse.quote("https://codearts.huaweicloud.com/portal/x", safe=""))
+check("多个 pending 时不认领 secret-only 回调",
+      status == 400 and "登录会话不存在" in html, (status, html[:160]))
+with C._OAUTH_LOCK:
+    for sid in (first["session_id"], second["session_id"]):
+        C._OAUTH_SESSIONS.pop(sid, None)
 
 print()
 print("PASS=%d FAIL=%d" % (PASS, FAIL))
