@@ -129,6 +129,16 @@ DEFAULTS = {
     "busy_wait_seconds": BUSY_WAIT_SECONDS,
     "benefit_auto_claim": True,
     "credits_auto_claim": False,
+    # ---- 冷却参数（默认值与下面的模块常量一致：不改变老安装的行为）----
+    # 这些时长原先写死在模块常量里，面板和 settings.json 都改不了。部署环境
+    # 差别很大（家里宽带抖动 vs 机房专线），把上限交给运维比统一 60s 更合适。
+    # 0 表示「不冷却」。
+    "soft_cooldown_seconds": SOFT_COOLDOWN,
+    "err_cooldown_seconds": ERR_COOLDOWN,
+    "err_threshold": ERR_THRESHOLD,
+    "credit_cooldown_seconds": CREDIT_COOLDOWN,
+    "auth_cooldown_seconds": AUTH_COOLDOWN,
+    "auth_cooldown_max_seconds": AUTH_COOLDOWN_MAX,
 }
 
 #: Verified with the upstream validation error: reasoning_effort must be one of
@@ -263,6 +273,24 @@ def load_config(accounts_dir):
             0.0, 120.0),
         "benefit_auto_claim": raw.get("benefit_auto_claim", True) is not False,
         "credits_auto_claim": raw.get("credits_auto_claim", False) is True,
+        # 冷却参数。下界 0 = 明确允许「不冷却」；上界防止手滑写成一天。
+        "soft_cooldown_seconds": _positive_float(
+            raw.get("soft_cooldown_seconds"),
+            DEFAULTS["soft_cooldown_seconds"], 0.0, 3600.0),
+        "err_cooldown_seconds": _positive_float(
+            raw.get("err_cooldown_seconds"),
+            DEFAULTS["err_cooldown_seconds"], 0.0, 86400.0),
+        "err_threshold": _positive_int(
+            raw.get("err_threshold"), DEFAULTS["err_threshold"], 1, 100),
+        "credit_cooldown_seconds": _positive_float(
+            raw.get("credit_cooldown_seconds"),
+            DEFAULTS["credit_cooldown_seconds"], 0.0, 86400.0),
+        "auth_cooldown_seconds": _positive_float(
+            raw.get("auth_cooldown_seconds"),
+            DEFAULTS["auth_cooldown_seconds"], 0.0, 3600.0),
+        "auth_cooldown_max_seconds": _positive_float(
+            raw.get("auth_cooldown_max_seconds"),
+            DEFAULTS["auth_cooldown_max_seconds"], 0.0, 86400.0),
         "accounts_dir": accounts_dir,
     }
 
@@ -305,6 +333,25 @@ def save_config(accounts_dir, patch):
             0.0, 120.0)
         merged["benefit_auto_claim"] = merged.get("benefit_auto_claim", True) is not False
         merged["credits_auto_claim"] = merged.get("credits_auto_claim", False) is True
+        # 冷却参数与 load_config 用同一套清洗规则，避免「load 时夹紧、save 时
+        # 原样写回」导致面板显示值与磁盘值不一致。
+        merged["soft_cooldown_seconds"] = _positive_float(
+            merged.get("soft_cooldown_seconds"),
+            DEFAULTS["soft_cooldown_seconds"], 0.0, 3600.0)
+        merged["err_cooldown_seconds"] = _positive_float(
+            merged.get("err_cooldown_seconds"),
+            DEFAULTS["err_cooldown_seconds"], 0.0, 86400.0)
+        merged["err_threshold"] = _positive_int(
+            merged.get("err_threshold"), DEFAULTS["err_threshold"], 1, 100)
+        merged["credit_cooldown_seconds"] = _positive_float(
+            merged.get("credit_cooldown_seconds"),
+            DEFAULTS["credit_cooldown_seconds"], 0.0, 86400.0)
+        merged["auth_cooldown_seconds"] = _positive_float(
+            merged.get("auth_cooldown_seconds"),
+            DEFAULTS["auth_cooldown_seconds"], 0.0, 3600.0)
+        merged["auth_cooldown_max_seconds"] = _positive_float(
+            merged.get("auth_cooldown_max_seconds"),
+            DEFAULTS["auth_cooldown_max_seconds"], 0.0, 86400.0)
         # 重新读 settings：`load_config` 只返回收敛后的 codearts 段，写回去要
         # 保留其它段（api_keys / realm / 媒体配置…），所以必须拿整份再合并。
         data = wb_settings.load(accounts_dir)
@@ -953,9 +1000,13 @@ class CodeArtsPool(object):
             acct.last_error = text
         if not acct.needs_relogin:
             acct.auth_err_count = min(acct.auth_err_count + 1, AUTH_ERR_CAP)
-            delay = min(AUTH_COOLDOWN_MAX,
-                        AUTH_COOLDOWN * (2 ** (acct.auth_err_count - 1)))
-            acct.cool_until = time.time() + delay
+            base = self.config.get("auth_cooldown_seconds",
+                                   DEFAULTS["auth_cooldown_seconds"])
+            cap = self.config.get("auth_cooldown_max_seconds",
+                                  DEFAULTS["auth_cooldown_max_seconds"])
+            delay = min(cap, base * (2 ** (acct.auth_err_count - 1)))
+            if delay > 0:
+                acct.cool_until = time.time() + delay
         self.save_state()
 
     def note_error(self, acct, message, soft=False, terminal=False,
@@ -965,13 +1016,25 @@ class CodeArtsPool(object):
             acct.disabled = True
             acct.disabled_reason = acct.last_error
         elif soft:
-            delay = SOFT_COOLDOWN if cooldown is None else max(0.0, float(cooldown))
-            acct.cool_until = time.time() + delay
+            if cooldown is None:
+                delay = float(self.config.get(
+                    "soft_cooldown_seconds",
+                    DEFAULTS["soft_cooldown_seconds"]))
+            else:
+                delay = max(0.0, float(cooldown))
+            if delay > 0:
+                acct.cool_until = time.time() + delay
         else:
             acct.err_count += 1
-            if acct.err_count >= ERR_THRESHOLD:
-                acct.cool_until = time.time() + ERR_COOLDOWN
+            threshold = int(self.config.get("err_threshold",
+                                            DEFAULTS["err_threshold"]))
+            if acct.err_count >= threshold:
                 acct.err_count = 0
+                delay = float(self.config.get(
+                    "err_cooldown_seconds",
+                    DEFAULTS["err_cooldown_seconds"]))
+                if delay > 0:
+                    acct.cool_until = time.time() + delay
         self.save_state()
 
 
@@ -2435,7 +2498,12 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             last_error = exc
         except CodeArtsUpstreamError as exc:
             soft = (exc.status == 429 or "429" in str(exc.code or ""))
-            cooldown = CREDIT_COOLDOWN if exc.code == "CREDIT_EXHAUSTED" else None
+            if exc.code == "CREDIT_EXHAUSTED":
+                cooldown = pool.config.get(
+                    "credit_cooldown_seconds",
+                    DEFAULTS["credit_cooldown_seconds"])
+            else:
+                cooldown = None
             pool.note_error(acct, str(exc), soft=soft, cooldown=cooldown)
             pool.release(acct)
             exclude.add(acct.uid)

@@ -10375,6 +10375,36 @@ html:not([data-ui="next"]) .settings-cat-bar{
           <input id="setCodeartsModelsTtl" type="number" min="1" max="3600"
                  style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
         </div>
+        <div>
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">429 软冷却（秒，0 = 不冷却）</div>
+          <input id="setCodeartsSoftCooldown" type="number" min="0" max="3600" step="any"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">错误冷却（秒，0 = 不冷却）</div>
+          <input id="setCodeartsErrCooldown" type="number" min="0" max="86400" step="any"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">连续错误阈值（次）</div>
+          <input id="setCodeartsErrThreshold" type="number" min="1" max="100"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">积分耗尽冷却（秒，0 = 不冷却）</div>
+          <input id="setCodeartsCreditCooldown" type="number" min="0" max="86400" step="any"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">401 退避基数（秒）</div>
+          <input id="setCodeartsAuthCooldown" type="number" min="0" max="3600" step="any"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">401 退避上限（秒）</div>
+          <input id="setCodeartsAuthCooldownMax" type="number" min="0" max="86400" step="any"
+                 style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+        </div>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px">
         <button onclick="saveCodeartsSettings(this)">保存 CodeArts 设置</button>
@@ -12946,6 +12976,18 @@ function renderCodeartsSettings(cfg){
   if(stream) stream.value = cfg.stream_timeout_seconds || 600;
   const ttl = document.getElementById("setCodeartsModelsTtl");
   if(ttl) ttl.value = cfg.models_ttl_seconds || 300;
+  // 0 是合法值（= 不冷却），不能用 `|| 默认值` 兜底，否则用户填 0 会被改回 60。
+  const num = (id, value, fallback) => {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.value = (value === 0 || value) ? value : fallback;
+  };
+  num("setCodeartsSoftCooldown", cfg.soft_cooldown_seconds, 60);
+  num("setCodeartsErrCooldown", cfg.err_cooldown_seconds, 600);
+  num("setCodeartsErrThreshold", cfg.err_threshold, 3);
+  num("setCodeartsCreditCooldown", cfg.credit_cooldown_seconds, 600);
+  num("setCodeartsAuthCooldown", cfg.auth_cooldown_seconds, 60);
+  num("setCodeartsAuthCooldownMax", cfg.auth_cooldown_max_seconds, 1800);
   const state = document.getElementById("setCodeartsState");
   if(state){
     state.textContent = cfg.configured ? "(已启用)" : "(未启用)";
@@ -12968,6 +13010,19 @@ async function saveCodeartsSettings(btn){
     stream_timeout_seconds: parseFloat(val("setCodeartsStreamTimeout")) || 600,
     models_ttl_seconds: parseFloat(val("setCodeartsModelsTtl")) || 300,
   };
+  // 冷却参数：0 必须能表达（= 不冷却），所以空串才回退默认值，不能用 ||。
+  const num = (id, fallback) => {
+    const raw = val(id);
+    if(raw === "" || raw === null || raw === undefined) return fallback;
+    const parsed = Number(raw);
+    return isFinite(parsed) ? parsed : fallback;
+  };
+  payload.soft_cooldown_seconds = num("setCodeartsSoftCooldown", 60);
+  payload.err_cooldown_seconds = num("setCodeartsErrCooldown", 600);
+  payload.err_threshold = num("setCodeartsErrThreshold", 3);
+  payload.credit_cooldown_seconds = num("setCodeartsCreditCooldown", 600);
+  payload.auth_cooldown_seconds = num("setCodeartsAuthCooldown", 60);
+  payload.auth_cooldown_max_seconds = num("setCodeartsAuthCooldownMax", 1800);
   if(btn) btn.disabled = true;
   try{
     const r = await postJSON("/settings/save", {codearts: payload});

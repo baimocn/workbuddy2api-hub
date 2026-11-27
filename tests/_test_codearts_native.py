@@ -637,6 +637,73 @@ try:
                              "busy_wait_seconds": C.BUSY_WAIT_SECONDS})
     acct.models = models_before
 
+    print("== cooldown parameters are configurable ==")
+    defaults = C.load_config(ACCOUNTS)
+    check("defaults keep the legacy effective values",
+          defaults["soft_cooldown_seconds"] == 60.0
+          and defaults["err_cooldown_seconds"] == 600.0
+          and defaults["err_threshold"] == 3
+          and defaults["credit_cooldown_seconds"] == 600.0
+          and defaults["auth_cooldown_seconds"] == 60.0
+          and defaults["auth_cooldown_max_seconds"] == 1800.0,
+          {k: defaults[k] for k in (
+              "soft_cooldown_seconds", "err_cooldown_seconds", "err_threshold",
+              "credit_cooldown_seconds", "auth_cooldown_seconds",
+              "auth_cooldown_max_seconds")})
+
+    C.save_config(ACCOUNTS, {
+        "soft_cooldown_seconds": 0,
+        "err_cooldown_seconds": 0,
+        "err_threshold": 2,
+        "credit_cooldown_seconds": 0,
+        "auth_cooldown_seconds": 0,
+        "auth_cooldown_max_seconds": 0,
+    })
+    tuned = C.load_config(ACCOUNTS)
+    check("zero survives the config roundtrip",
+          tuned["soft_cooldown_seconds"] == 0
+          and tuned["err_cooldown_seconds"] == 0
+          and tuned["credit_cooldown_seconds"] == 0
+          and tuned["auth_cooldown_seconds"] == 0
+          and tuned["auth_cooldown_max_seconds"] == 0, tuned)
+    check("err_threshold is configurable", tuned["err_threshold"] == 2, tuned)
+
+    C.pool_for(ACCOUNTS)          # 让池子重新读一份配置
+    acct.cool_until = 0
+    acct.err_count = 0
+    acct.auth_err_count = 0
+    pool.note_error(acct, "boom", soft=True)
+    check("soft cooldown 0 means no cooldown", acct.cool_until == 0, acct.cool_until)
+    pool.note_error(acct, "boom", soft=True, cooldown=5.0)
+    check("explicit cooldown still wins over the config",
+          acct.cool_until > time.time() + 3, acct.cool_until)
+    acct.cool_until = 0
+    acct.err_count = 0
+    pool.note_error(acct, "boom")
+    check("err_threshold 2: first error does not cool",
+          acct.cool_until == 0 and acct.err_count == 1, acct.err_count)
+    pool.note_error(acct, "boom")
+    check("err_threshold 2: second error resets the counter",
+          acct.err_count == 0, acct.err_count)
+    check("err cooldown 0 means no cooldown", acct.cool_until == 0, acct.cool_until)
+    acct.cool_until = 0
+    acct.auth_err_count = 0
+    pool.note_auth_failure(acct, "401")
+    check("auth cooldown 0 means no cooldown", acct.cool_until == 0, acct.cool_until)
+
+    C.save_config(ACCOUNTS, {
+        "soft_cooldown_seconds": 60,
+        "err_cooldown_seconds": 600,
+        "err_threshold": 3,
+        "credit_cooldown_seconds": 600,
+        "auth_cooldown_seconds": 60,
+        "auth_cooldown_max_seconds": 1800,
+    })
+    C.pool_for(ACCOUNTS)
+    acct.cool_until = 0
+    acct.err_count = 0
+    acct.auth_err_count = 0
+
     print("== credit exhausted cooldown ==")
     credit_message = (
         "您的积分已耗尽，请关注活动积分领取活动或者[升级套餐]"
